@@ -9,18 +9,13 @@ the main data import functionality from the 1C API.
 # Standard library imports
 import asyncio
 import time
-import json
 import os
-import logging
 from datetime import datetime
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Set
 from io import StringIO
 
 # Third-party imports
 import pandas as pd
-import requests
-import aiohttp
-from fastapi import FastAPI, HTTPException, Depends
 from pydantic import BaseModel
 from sqlalchemy.orm import Session, sessionmaker, aliased
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
@@ -47,7 +42,6 @@ from models import (
 )
 from api1C import ApiClient
 from db import AsyncSessionLocal, load_dotenv
-import os
 
 # Загрузка переменных окружения из файла .env
 load_dotenv()
@@ -61,11 +55,28 @@ AsyncSessionLocal = sessionmaker(engine, expire_on_commit=False, class_=AsyncSes
 
 
 async def process_products(products, session, product_attributes=None, analogs_data=None, barcodes_data=None, 
-                      certificates_data=None, photos_data=None, instructions_data=None, prices_data=None, stock_data=None):
+                      certificates_data=None, photos_data=None, instructions_data=None, prices_data=None, stock_data=None, processed_articles=None):
+    """
+    Process products and their related data (attributes, analogs, barcodes, etc.).
+
+    This function uses an optimized approach to prevent unique constraint violations:
+    1. For each data type, we get existing records from the database
+    2. We compare existing records with new data from the API
+    3. We only delete records that are no longer in the API
+    4. We only add records that don't already exist in the database
+    5. For some data types (e.g., prices), we update existing records with new values
+
+    This approach is more efficient and prevents unique constraint violations that can
+    occur when deleting and adding records in the same transaction.
+    """
     for prod in products:
         article = prod.get('article')
         name = prod.get('name')
         class_rusname = prod.get('sdsclass', {}).get('rusname')
+
+        # Add article to processed_articles set if it's provided
+        if processed_articles is not None and article:
+            processed_articles.add(article)
 
         unit = prod.get('unit')
         unitpak = prod.get('unitpak')
@@ -118,7 +129,7 @@ async def process_products(products, session, product_attributes=None, analogs_d
             attributes = product_attributes[article]
 
             if attributes:
-                print(f"{article} - attributes:", len(attributes))
+                print(f"{article} - attributes: {len(attributes)}")
 
             for char in attributes:
                 char_name = char.get('characteristic')
@@ -211,106 +222,174 @@ async def process_products(products, session, product_attributes=None, analogs_d
 
         # Обработка аналогов
         if analogs_data and article in analogs_data:
-            # Сначала удаляем существующие аналоги для этого товара
+            # Получаем существующие аналоги для этого товара
             stmt = select(ProductAnalog).where(ProductAnalog.product_id == product.id)
             result = await session.execute(stmt)
             existing_analogs = result.scalars().all()
-            for existing_analog in existing_analogs:
-                await session.delete(existing_analog)
 
-            # Добавляем новые аналоги
-            for analog_article in analogs_data[article]:
-                analog = ProductAnalog(
-                    product_id=product.id,
-                    article=analog_article
-                )
-                session.add(analog)
+            # Создаем множество существующих аналогов для быстрой проверки
+            existing_analog_values = {a.article for a in existing_analogs}
+
+            # Создаем множество новых аналогов
+            new_analog_values = set(analogs_data[article])
+
+            # Удаляем аналоги, которых больше нет в API
+            for existing_analog in existing_analogs:
+                if existing_analog.article not in new_analog_values:
+                    await session.delete(existing_analog)
+
+            # Добавляем только новые аналоги, которых еще нет в базе
+            for analog_article in new_analog_values:
+                if analog_article not in existing_analog_values:
+                    analog = ProductAnalog(
+                        product_id=product.id,
+                        article=analog_article
+                    )
+                    session.add(analog)
 
         # Обработка штрихкодов
         if barcodes_data and article in barcodes_data:
-            # Сначала удаляем существующие штрихкоды для этого товара
+            # Получаем существующие штрихкоды для этого товара
             stmt = select(ProductBarcode).where(ProductBarcode.product_id == product.id)
             result = await session.execute(stmt)
             existing_barcodes = result.scalars().all()
-            for existing_barcode in existing_barcodes:
-                await session.delete(existing_barcode)
 
-            # Добавляем новые штрихкоды
-            for barcode in barcodes_data[article]:
-                barcode_obj = ProductBarcode(
-                    product_id=product.id,
-                    barcode=barcode
-                )
-                session.add(barcode_obj)
+            # Создаем множество существующих штрихкодов для быстрой проверки
+            existing_barcode_values = {b.barcode for b in existing_barcodes}
+
+            # Создаем множество новых штрихкодов
+            new_barcode_values = set(barcodes_data[article])
+
+            # Удаляем штрихкоды, которых больше нет в API
+            for existing_barcode in existing_barcodes:
+                if existing_barcode.barcode not in new_barcode_values:
+                    await session.delete(existing_barcode)
+
+            # Добавляем только новые штрихкоды, которых еще нет в базе
+            for barcode in new_barcode_values:
+                if barcode not in existing_barcode_values:
+                    barcode_obj = ProductBarcode(
+                        product_id=product.id,
+                        barcode=barcode
+                    )
+                    session.add(barcode_obj)
 
         # Обработка сертификатов временно отключена из-за технических проблем в API
         # if certificates_data and article in certificates_data:
-        #     # Сначала удаляем существующие сертификаты для этого товара
+        #     # Получаем существующие сертификаты для этого товара
         #     stmt = select(ProductCertificate).where(ProductCertificate.product_id == product.id)
         #     result = await session.execute(stmt)
         #     existing_certificates = result.scalars().all()
+        #     
+        #     # Создаем множество существующих сертификатов для быстрой проверки
+        #     existing_certificate_links = {c.certificate_link for c in existing_certificates}
+        #     
+        #     # Создаем множество новых сертификатов
+        #     new_certificate_links = set(certificates_data[article])
+        #     
+        #     # Удаляем сертификаты, которых больше нет в API
         #     for existing_certificate in existing_certificates:
-        #         await session.delete(existing_certificate)
-        #
-        #     # Добавляем новые сертификаты
-        #     for cert_link in certificates_data[article]:
-        #         certificate = ProductCertificate(
-        #             product_id=product.id,
-        #             certificate_link=cert_link
-        #         )
-        #         session.add(certificate)
+        #         if existing_certificate.certificate_link not in new_certificate_links:
+        #             await session.delete(existing_certificate)
+        #     
+        #     # Добавляем только новые сертификаты, которых еще нет в базе
+        #     for cert_link in new_certificate_links:
+        #         if cert_link not in existing_certificate_links:
+        #             certificate = ProductCertificate(
+        #                 product_id=product.id,
+        #                 certificate_link=cert_link
+        #             )
+        #             session.add(certificate)
 
         # Обработка фотографий
         if photos_data and article in photos_data:
-            # Сначала удаляем существующие фотографии для этого товара
+            # Получаем существующие фотографии для этого товара
             stmt = select(ProductPhoto).where(ProductPhoto.product_id == product.id)
             result = await session.execute(stmt)
             existing_photos = result.scalars().all()
+
+            # Создаем множество существующих фотографий для быстрой проверки
+            existing_photo_links = {p.photo_link for p in existing_photos}
+
+            # Создаем множество новых фотографий
+            new_photo_links = set(photos_data[article])
+
+            # Удаляем фотографии, которых больше нет в API
             for existing_photo in existing_photos:
-                await session.delete(existing_photo)
+                if existing_photo.photo_link not in new_photo_links:
+                    await session.delete(existing_photo)
 
-            # Добавляем новые фотографии
-            for photo_link in photos_data[article]:
-                photo = ProductPhoto(
-                    product_id=product.id,
-                    photo_link=photo_link
-                )
-                session.add(photo)
+            # Добавляем только новые фотографии, которых еще нет в базе
+            for photo_link in new_photo_links:
+                if photo_link not in existing_photo_links:
+                    photo = ProductPhoto(
+                        product_id=product.id,
+                        photo_link=photo_link
+                    )
+                    session.add(photo)
 
-        # Обработка инструкций временно отключена из-за технических проблем в API
-        # if instructions_data and article in instructions_data:
-        #     # Сначала удаляем существующие инструкции для этого товара
-        #     stmt = select(ProductInstruction).where(ProductInstruction.product_id == product.id)
-        #     result = await session.execute(stmt)
-        #     existing_instructions = result.scalars().all()
-        #     for existing_instruction in existing_instructions:
-        #         await session.delete(existing_instruction)
-        #
-        #     # Добавляем новые инструкции
-        #     for instr_link in instructions_data[article]:
-        #         instruction = ProductInstruction(
-        #             product_id=product.id,
-        #             instruction_link=instr_link
-        #         )
-        #         session.add(instruction)
+        # Обработка инструкций
+        if instructions_data and article in instructions_data:
+            # Получаем существующие инструкции для этого товара
+            stmt = select(ProductInstruction).where(ProductInstruction.product_id == product.id)
+            result = await session.execute(stmt)
+            existing_instructions = result.scalars().all()
+
+            # Создаем множество существующих инструкций для быстрой проверки
+            existing_instruction_links = {i.instruction_link for i in existing_instructions}
+
+            # Создаем множество новых инструкций
+            new_instruction_links = set(instructions_data[article])
+
+            # Удаляем инструкции, которых больше нет в API
+            for existing_instruction in existing_instructions:
+                if existing_instruction.instruction_link not in new_instruction_links:
+                    await session.delete(existing_instruction)
+
+            # Добавляем только новые инструкции, которых еще нет в базе
+            for instr_link in new_instruction_links:
+                if instr_link not in existing_instruction_links:
+                    instruction = ProductInstruction(
+                        product_id=product.id,
+                        instruction_link=instr_link
+                    )
+                    session.add(instruction)
 
         # Обработка цен
         if prices_data and article in prices_data:
-            # Сначала удаляем существующие цены для этого товара
+            # Получаем существующие цены для этого товара
             stmt = select(ProductPrice).where(ProductPrice.product_id == product.id)
             result = await session.execute(stmt)
             existing_prices = result.scalars().all()
-            for existing_price in existing_prices:
-                await session.delete(existing_price)
 
-            # Добавляем новые цены
+            # Создаем словарь существующих цен для быстрой проверки
+            # Используем price_type как ключ, так как он должен быть уникальным для каждого продукта
+            existing_price_types = {p.price_type: p for p in existing_prices}
+
+            # Создаем множество новых типов цен
+            new_price_types = {p['price_type'] for p in prices_data[article]}
+
+            # Удаляем цены, которых больше нет в API
+            for price_type, existing_price in list(existing_price_types.items()):
+                if price_type not in new_price_types:
+                    await session.delete(existing_price)
+
+            # Добавляем или обновляем цены
             for price_data in prices_data[article]:
-                price = ProductPrice(
-                    product_id=product.id,
-                    price_type=price_data['price_type'],
-                    price=price_data['price']
-                )
-                session.add(price)
+                price_type = price_data['price_type']
+                price_value = price_data['price']
+
+                if price_type in existing_price_types:
+                    # Обновляем существующую цену
+                    existing_price_types[price_type].price = price_value
+                else:
+                    # Добавляем новую цену
+                    price = ProductPrice(
+                        product_id=product.id,
+                        price_type=price_type,
+                        price=price_value
+                    )
+                    session.add(price)
 
         # Обновление общего остатка
         if stock_data and article in stock_data:
@@ -319,7 +398,7 @@ async def process_products(products, session, product_attributes=None, analogs_d
 
     await session.commit()
 
-async def main():
+async def main(return_processed_articles=False):
     # Start timing the entire process
     total_start_time = time.time()
     start_datetime = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -340,10 +419,13 @@ async def main():
         "timings": {}
     }
 
+    # Set to track processed articles
+    processed_articles = set()
+
     client = ApiClient(token=TOKEN)
 
     # Сначала загружаем все атрибуты продуктов
-    print("\n[1/9] Fetching all product attributes...")
+    print("[1/9] Fetching all product attributes...")
     attr_start_time = time.time()
     product_attributes = {}
     attr_limit = 100000
@@ -496,7 +578,6 @@ async def main():
     # Временно отключаем загрузку сертификатов из-за технических проблем в API
     print("\n[4/9] Skipping certificates due to API technical issues...")
     certificates_start_time = time.time()
-    certificates_data = {}
     stats["certificates"] = 0
 
     certificates_end_time = time.time()
@@ -546,17 +627,45 @@ async def main():
     print(f"  Completed: Total products with photos: {len(photos_data)}")
     print(f"  Time taken: {photos_elapsed:.2f} seconds")
 
-    # Временно отключаем загрузку инструкций из-за технических проблем в API
-    print("\n[6/9] Skipping instructions due to API technical issues...")
+    # Загружаем инструкции
+    print("\n[6/9] Fetching instructions...")
     instructions_start_time = time.time()
-    instructions_data = {}
-    stats["instructions"] = 0
+    instructions_limit = 100000
+    instructions_offset = 0
+    total_instructions_count = 0
+
+    # Теперь загружаем инструкции и связываем их с артикулами через product_id
+    while True:
+        instructions_response = await client.get_instructions(limit=instructions_limit, offset=instructions_offset)
+        instructions_results = instructions_response['result']['results']
+        if not instructions_results:
+            break
+
+        total_instructions_count += len(instructions_results)
+
+        for instruction in instructions_results:
+            article = instruction.get('article')
+            if not article:
+                continue
+
+            if article not in instructions_data:
+                instructions_data[article] = []
+
+            instruction_link = instruction.get('filelink')
+            if instruction_link:
+                instructions_data[article].append(instruction_link)
+                stats["instructions"] += 1
+
+        print(f"  Progress: Loaded {total_instructions_count} instructions (offset={instructions_offset})")
+        if len(instructions_results) < instructions_limit:
+            break
+        instructions_offset += instructions_limit
 
     instructions_end_time = time.time()
     instructions_elapsed = instructions_end_time - instructions_start_time
     stats["timings"]["instructions"] = instructions_elapsed
 
-    print(f"  Instructions loading skipped due to API technical issues")
+    print(f"  Completed: Total products with instructions: {len(instructions_data)}")
     print(f"  Time taken: {instructions_elapsed:.2f} seconds")
 
     # Загружаем цены с использованием limit и offset
@@ -694,7 +803,8 @@ async def main():
                 photos_data,
                 instructions_data,
                 prices_data,
-                stock_data
+                stock_data,
+                processed_articles
             )
 
         stats["products"] += len(results)
@@ -740,6 +850,10 @@ async def main():
         print(f"  {operation}: {elapsed:.2f} seconds ({percentage:.1f}%)")
 
     print("="*50)
+
+    # Return the set of processed articles if requested
+    if return_processed_articles:
+        return processed_articles
 
 if __name__ == "__main__":
     asyncio.run(main())

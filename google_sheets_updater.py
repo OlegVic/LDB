@@ -34,8 +34,8 @@ import aiohttp
 import asyncio
 import logging
 from io import StringIO
-from sqlalchemy.orm import Session
-from sqlalchemy import update
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import update, select
 from db import AsyncSessionLocal
 from models import ClassClarify, CharacteristicClarify
 from dotenv import load_dotenv
@@ -138,7 +138,7 @@ async def get_sheet_data(gid, tab_name=""):
         logger.error(f"Error getting sheet data{tab_info}: {str(e)}", exc_info=True)
         return None
 
-async def update_classes(session: Session):
+async def update_classes(session: AsyncSession):
     """
     Update the ClassClarify table with data from the Classes tab in Google Sheets.
 
@@ -176,7 +176,8 @@ async def update_classes(session: Session):
             logger.warning(f"Missing optional columns in Classes sheet: {missing_optional}")
 
         # Get all class_rusname values from the database
-        db_classes = session.query(ClassClarify).all()
+        result = await session.execute(select(ClassClarify))
+        db_classes = result.scalars().all()
         logger.info(f"Found {len(db_classes)} classes in the database")
 
         # Update count
@@ -220,15 +221,15 @@ async def update_classes(session: Session):
                 logger.warning(f"Error processing class {db_class.class_rusname}: {str(e)}")
 
         # Commit the changes
-        session.commit()
+        await session.commit()
 
         logger.info(f"Updated {updated_count} classes out of {len(db_classes)}")
 
     except Exception as e:
-        session.rollback()
+        await session.rollback()
         logger.error(f"Error updating classes: {str(e)}", exc_info=True)
 
-async def update_characteristics(session: Session):
+async def update_characteristics(session: AsyncSession):
     """
     Update the CharacteristicClarify table with data from the Characteristics tab in Google Sheets.
 
@@ -266,7 +267,8 @@ async def update_characteristics(session: Session):
             logger.warning(f"Missing optional columns in Characteristics sheet: {missing_optional}")
 
         # Get all characteristic_good values from the database
-        db_characteristics = session.query(CharacteristicClarify).all()
+        result = await session.execute(select(CharacteristicClarify))
+        db_characteristics = result.scalars().all()
         logger.info(f"Found {len(db_characteristics)} characteristics in the database")
 
         # Create a dictionary of existing characteristic values to check for duplicates
@@ -349,12 +351,12 @@ async def update_characteristics(session: Session):
                 logger.warning(f"Error processing characteristic {db_char.characteristic_good}: {str(e)}")
 
         # Commit the changes
-        session.commit()
+        await session.commit()
 
         logger.info(f"Updated {updated_count} characteristics out of {len(db_characteristics)}, skipped {skipped_count} due to unique constraint")
 
     except Exception as e:
-        session.rollback()
+        await session.rollback()
         logger.error(f"Error updating characteristics: {str(e)}", exc_info=True)
 
 async def main():
@@ -377,7 +379,7 @@ async def main():
     except Exception as e:
         logger.error(f"Error during database update: {str(e)}", exc_info=True)
     finally:
-        session.close()
+        await session.close()
         logger.info("Database session closed.")
 
 if __name__ == "__main__":

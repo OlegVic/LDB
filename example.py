@@ -75,10 +75,8 @@ async def main():
             "articles": [],
             "keys": ["кабе"],
             "classes": [],
-            "groups": ["Аудио-Видео и сопутствующие товары"],
-            "characteristics": {
-
-            }
+            "groups": [],
+            "characteristics": {}
         },
         "exclude": {
             "articles": [],

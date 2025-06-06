@@ -1,7 +1,6 @@
 fastapi
 uvicorn
 sqlalchemy
-psycopg2
 asyncpg
 pydantic
 pandas
@@ -9,3 +8,4 @@ gspread
 oauth2client
 python-dotenv
 aiohttp
+apscheduler
