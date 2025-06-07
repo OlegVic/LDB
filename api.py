@@ -1,11 +1,16 @@
-from sds_import import (
-    FastAPI, HTTPException, Depends,
-    BaseModel, Dict, List, Any, Optional,
-    json
-)
+import os
+import uvicorn
+import json
+from pydantic import BaseModel, Field
+from typing import Dict, List, Any, Optional
+from fastapi import FastAPI, Request, HTTPException, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 from db import get_async_session
 from search import ProductSearch
+from dotenv import load_dotenv
+
+# Загрузка переменных окружения из файла .env
+load_dotenv()
 
 app = FastAPI(
     title="LDB - Product Search API",
@@ -19,7 +24,7 @@ app = FastAPI(
 @app.get("/", 
          summary="API Root",
          description="Get basic information about the API")
-def read_root():
+async def read_root():
     """
     Root endpoint for the LDB API.
 
@@ -234,14 +239,8 @@ async def structured_search_v2(search_criteria: SearchCriteriaModel, db: AsyncSe
         raise HTTPException(status_code=500, detail=f"Search error: {str(e)}")
 
 if __name__ == "__main__":
-    import os
-    import uvicorn
-    from dotenv import load_dotenv
-
-    # Загрузка переменных окружения из файла .env
-    load_dotenv()
-
     # Получение порта из переменных окружения
-    port = int(os.getenv("API_PORT", 9898))
+    api_port = int(os.getenv("API_PORT", 9898))
 
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    print(f"Starting server on port {api_port}...")
+    uvicorn.run(app, host="0.0.0.0", port=api_port, loop="none")
